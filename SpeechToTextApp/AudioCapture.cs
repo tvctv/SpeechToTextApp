@@ -38,6 +38,7 @@ namespace SpeechToTextApp
                 AudioDataAvailable?.Invoke(this, buffer);
             };
             _waveIn.StartRecording();
+            try { Logger.Info($"AudioCapture started. Device={deviceId} Index={deviceIndex}"); } catch { }
         }
 
         public void Stop()
@@ -45,6 +46,7 @@ namespace SpeechToTextApp
             try { _waveIn?.StopRecording(); } catch { }
             try { _waveIn?.Dispose(); } catch { }
             _waveIn = null;
+            try { Logger.Info("AudioCapture stopped."); } catch { }
         }
 
         public void Dispose() => Stop();

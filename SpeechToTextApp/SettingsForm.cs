@@ -1,5 +1,5 @@
 using System;
-using System.IO.Ports;
+using System.IO;
 using System.Linq;
 using System.Windows.Forms;
 
@@ -8,51 +8,141 @@ namespace SpeechToTextApp
     public partial class SettingsForm : Form
     {
         private readonly AppSettings _settings;
+        private AudioCapture? _testCapture;
+        private readonly System.Windows.Forms.Timer _levelTimer = new System.Windows.Forms.Timer();
+        private volatile int _lastLevel;
 
         public SettingsForm(AppSettings settings)
         {
             InitializeComponent();
             _settings = settings;
+            _levelTimer.Interval = 100;
+            _levelTimer.Tick += (s, e) => prgLevel.Value = Math.Max(0, Math.Min(100, _lastLevel));
             LoadValues();
         }
 
         private void LoadValues()
         {
             txtHost.Text = _settings.SceHost;
-            numPort.Value = _settings.ScePort;
+            numPort.Value = Math.Max(numPort.Minimum, Math.Min(numPort.Maximum, _settings.ScePort));
             chkUdp.Checked = _settings.SceUseUdp;
             chkEnableSce.Checked = _settings.SceEnabled;
 
-            cmbSerial.Items.Clear();
-            cmbSerial.Items.Add("(none)");
-            foreach (var port in SerialPort.GetPortNames())
-                cmbSerial.Items.Add(port);
-            cmbSerial.SelectedItem = string.IsNullOrWhiteSpace(_settings.SerialPortName) ? "(none)" : _settings.SerialPortName;
-            numBaud.Value = _settings.SerialBaud;
-
             cmbAudio.Items.Clear();
-            var devs = AudioCapture.ListInputDevices();
-            foreach (var d in devs) cmbAudio.Items.Add($"{d.id}|{d.name}");
+            var devices = AudioCapture.ListInputDevices();
+            foreach (var device in devices)
+            {
+                cmbAudio.Items.Add($"{device.id}|{device.name}");
+            }
             if (!string.IsNullOrEmpty(_settings.AudioDeviceId))
             {
-                var match = devs.FirstOrDefault(x => x.id == _settings.AudioDeviceId);
+                var match = devices.FirstOrDefault(d => d.id == _settings.AudioDeviceId);
                 if (!string.IsNullOrEmpty(match.id))
                 {
                     cmbAudio.SelectedItem = $"{match.id}|{match.name}";
                 }
             }
-            if (cmbAudio.SelectedIndex < 0 && cmbAudio.Items.Count > 0) cmbAudio.SelectedIndex = 0;
+            if (cmbAudio.SelectedIndex < 0 && cmbAudio.Items.Count > 0)
+            {
+                cmbAudio.SelectedIndex = 0;
+            }
 
-            cmbModel.Items.Clear();
-            cmbModel.Items.Add("Small (English)");
-            cmbModel.Items.Add("Medium (English)");
-            cmbModel.SelectedIndex = _settings.Model == ModelSize.SmallEn ? 0 : 1;
-
-            txtModelDir.Text = _settings.ModelDir;
-            txtSmall.Text = _settings.SmallModelFile;
-            txtMedium.Text = _settings.MediumModelFile;
+            var modelPath = SafeResolveModelPath();
+            txtModelPath.Text = modelPath;
 
             chkProfanity.Checked = _settings.ProfanityFilterEnabled;
+            chkUseGpu.Checked = _settings.PreferGpu;
+            chkDetailed.Checked = _settings.DetailedLogging;
+
+            var latency = Math.Max(trkLatency.Minimum, Math.Min(trkLatency.Maximum, _settings.LatencyMs));
+            trkLatency.Value = latency;
+            UpdateLatencyLabel();
+        }
+
+        private string SafeResolveModelPath()
+        {
+            try
+            {
+                var path = _settings.ResolveModelPath();
+                return Path.GetFullPath(path);
+            }
+            catch
+            {
+                return _settings.ResolveModelPath();
+            }
+        }
+
+        private void btnBrowseModel_Click(object sender, EventArgs e)
+        {
+            using var dlg = new OpenFileDialog
+            {
+                Filter = "Whisper models (*.bin)|*.bin|All files (*.*)|*.*",
+                Title = "Select Whisper model"
+            };
+
+            if (!string.IsNullOrWhiteSpace(txtModelPath.Text))
+            {
+                try
+                {
+                    var currentPath = Path.GetFullPath(txtModelPath.Text);
+                    dlg.InitialDirectory = Path.GetDirectoryName(currentPath) ?? AppContext.BaseDirectory;
+                    dlg.FileName = Path.GetFileName(currentPath);
+                }
+                catch { }
+            }
+
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                txtModelPath.Text = dlg.FileName;
+            }
+        }
+
+        private void btnTestAudio_Click(object sender, EventArgs e)
+        {
+            if (_testCapture == null)
+            {
+                var audioSel = cmbAudio.SelectedItem?.ToString() ?? string.Empty;
+                var deviceId = audioSel.Contains("|") ? audioSel.Split('|')[0] : audioSel;
+                _testCapture = new AudioCapture();
+                _testCapture.AudioDataAvailable += OnTestAudioData;
+                try
+                {
+                    _testCapture.Start(deviceId);
+                    _levelTimer.Start();
+                    btnTestAudio.Text = "Stop";
+                }
+                catch
+                {
+                    StopTestAudio();
+                }
+            }
+            else
+            {
+                StopTestAudio();
+            }
+        }
+
+        private void OnTestAudioData(object? sender, byte[] buffer)
+        {
+            int max = 0;
+            for (int i = 0; i + 1 < buffer.Length; i += 2)
+            {
+                int sample = (short)(buffer[i] | (buffer[i + 1] << 8));
+                int abs = Math.Abs(sample);
+                if (abs > max) max = abs;
+            }
+            _lastLevel = (int)Math.Min(100, Math.Round(max / 32767.0 * 100.0));
+        }
+
+        private void StopTestAudio()
+        {
+            try { _levelTimer.Stop(); } catch { }
+            try { _testCapture?.Stop(); } catch { }
+            try { _testCapture?.Dispose(); } catch { }
+            _testCapture = null;
+            _lastLevel = 0;
+            try { prgLevel.Value = 0; } catch { }
+            btnTestAudio.Text = "Test";
         }
 
         private void btnSave_Click(object sender, EventArgs e)
@@ -62,24 +152,52 @@ namespace SpeechToTextApp
             _settings.SceUseUdp = chkUdp.Checked;
             _settings.SceEnabled = chkEnableSce.Checked;
 
-            var serialSel = cmbSerial.SelectedItem?.ToString() ?? "(none)";
-            _settings.SerialPortName = serialSel == "(none)" ? null : serialSel;
-            _settings.SerialBaud = (int)numBaud.Value;
+            _settings.SerialPortName = null;
+            _settings.SerialBaud = 9600;
 
             var audioSel = cmbAudio.SelectedItem?.ToString() ?? "";
-            _settings.AudioDeviceId = audioSel.Split('|')[0];
+            _settings.AudioDeviceId = audioSel.Contains("|") ? audioSel.Split('|')[0] : audioSel;
 
-            _settings.Model = cmbModel.SelectedIndex == 0 ? ModelSize.SmallEn : ModelSize.MediumEn;
+            var modelPath = txtModelPath.Text.Trim();
+            if (!string.IsNullOrEmpty(modelPath))
+            {
+                try
+                {
+                    var fullPath = Path.GetFullPath(modelPath);
+                    _settings.SelectedModelFile = fullPath;
+                    _settings.ModelDir = Path.GetDirectoryName(fullPath) ?? _settings.ModelDir;
+                }
+                catch
+                {
+                    _settings.SelectedModelFile = modelPath;
+                }
+            }
 
-            _settings.ModelDir = txtModelDir.Text.Trim();
-            _settings.SmallModelFile = txtSmall.Text.Trim();
-            _settings.MediumModelFile = txtMedium.Text.Trim();
-
+            _settings.PreferGpu = chkUseGpu.Checked;
             _settings.ProfanityFilterEnabled = chkProfanity.Checked;
+            _settings.LatencyMs = trkLatency.Value;
+            _settings.DetailedLogging = chkDetailed.Checked;
 
             _settings.Save();
+            StopTestAudio();
             DialogResult = DialogResult.OK;
             Close();
+        }
+
+        private void trkLatency_ValueChanged(object sender, EventArgs e)
+        {
+            UpdateLatencyLabel();
+        }
+
+        private void UpdateLatencyLabel()
+        {
+            lblLatency.Text = $"Latency: {trkLatency.Value} ms";
+        }
+
+        protected override void OnFormClosed(FormClosedEventArgs e)
+        {
+            StopTestAudio();
+            base.OnFormClosed(e);
         }
     }
 }

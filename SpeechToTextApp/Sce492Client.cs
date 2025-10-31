@@ -1,5 +1,4 @@
 using System;
-using System.IO.Ports;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Tasks;
@@ -12,7 +11,6 @@ namespace SpeechToTextApp
         private UdpClient? _udp;
         private TcpClient? _tcp;
         private NetworkStream? _tcpStream;
-        private SerialPort? _serial;
 
         public bool Connected { get; private set; }
 
@@ -26,26 +24,28 @@ namespace SpeechToTextApp
             Disconnect();
             if (!_settings.SceEnabled) return;
 
-            if (!string.IsNullOrWhiteSpace(_settings.SerialPortName))
+            try
             {
-                _serial = new SerialPort(_settings.SerialPortName, _settings.SerialBaud);
-                _serial.Open();
-                Connected = _serial.IsOpen;
-                return;
+                if (_settings.SceUseUdp)
+                {
+                    _udp = new UdpClient();
+                    _udp.Connect(_settings.SceHost, _settings.ScePort);
+                    Connected = true;
+                    Logger.Info($"SCE UDP connected to {_settings.SceHost}:{_settings.ScePort}");
+                }
+                else
+                {
+                    _tcp = new TcpClient();
+                    await _tcp.ConnectAsync(_settings.SceHost, _settings.ScePort);
+                    _tcpStream = _tcp.GetStream();
+                    Connected = true;
+                    Logger.Info($"SCE TCP connected to {_settings.SceHost}:{_settings.ScePort}");
+                }
             }
-
-            if (_settings.SceUseUdp)
+            catch (Exception ex)
             {
-                _udp = new UdpClient();
-                _udp.Connect(_settings.SceHost, _settings.ScePort);
-                Connected = true;
-            }
-            else
-            {
-                _tcp = new TcpClient();
-                await _tcp.ConnectAsync(_settings.SceHost, _settings.ScePort);
-                _tcpStream = _tcp.GetStream();
-                Connected = true;
+                Connected = false; // suppress connection errors for testing
+                Logger.Exception("SceConnect", ex);
             }
         }
 
@@ -55,30 +55,44 @@ namespace SpeechToTextApp
             try { _udp?.Close(); } catch { }
             try { _tcpStream?.Close(); } catch { }
             try { _tcp?.Close(); } catch { }
-            try { if (_serial?.IsOpen == true) _serial.Close(); } catch { }
 
-            _udp = null; _tcp = null; _tcpStream = null; _serial = null;
+            _udp = null; _tcp = null; _tcpStream = null;
         }
 
         public async Task SendCaptionAsync(string text)
         {
             if (!_settings.SceEnabled) return;
-            var payload = Encoding.UTF8.GetBytes(text + "\r\n");
+            var payloadText = text.EndsWith("\r\n") ? text : text.TrimEnd('\r', '\n') + "\r\n";
+            var payload = Encoding.ASCII.GetBytes(payloadText);
 
-            if (_serial?.IsOpen == true)
+            if (!Connected)
             {
-                _serial.Write(text + "\r\n");
-                return;
+                await ConnectAsync();
+                if (!Connected)
+                {
+                    Logger.Info("SCE send skipped; not connected");
+                    return;
+                }
             }
 
-            if (_settings.SceUseUdp && _udp != null)
+            try
             {
-                await _udp.SendAsync(payload, payload.Length);
+                if (_settings.SceUseUdp && _udp != null)
+                {
+                    await _udp.SendAsync(payload, payload.Length);
+                    Logger.Info($"SCE UDP send: '{text}'");
+                }
+                else if (_tcpStream != null)
+                {
+                    await _tcpStream.WriteAsync(payload, 0, payload.Length);
+                    await _tcpStream.FlushAsync();
+                    Logger.Info($"SCE TCP send: '{text}'");
+                }
             }
-            else if (_tcpStream != null)
+            catch (Exception ex)
             {
-                await _tcpStream.WriteAsync(payload, 0, payload.Length);
-                await _tcpStream.FlushAsync();
+                Logger.Exception("SceSend", ex);
+                Disconnect();
             }
         }
 
